@@ -809,14 +809,9 @@ public class BNO055 {
 		int modeback = _mode;
 		byte [] calibData = new byte[22];
 		if(isFullyCalibrated()){
-			try {
-				setMode(opmode_t.OPERATION_MODE_CONFIG.getVal());
-				readLen(reg_t.ACCEL_OFFSET_X_LSB_ADDR, calibData);
-				setMode(modeback);
-			} catch (InterruptedException e) {
-				// TODO Auto-generated catch block
-				e.printStackTrace();
-			}
+			setMode(opmode_t.OPERATION_MODE_CONFIG.getVal());
+			readLen(reg_t.ACCEL_OFFSET_X_LSB_ADDR, calibData);
+			setMode(modeback);
 			return calibData;
 		}
 		return null;

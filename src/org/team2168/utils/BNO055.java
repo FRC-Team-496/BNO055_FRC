@@ -1,13 +1,51 @@
 package org.team2168.utils;
 
+import java.util.TimerTask;
+
 import edu.wpi.first.wpilibj.I2C;
+import edu.wpi.first.wpilibj.Timer;
 
 /**
- * A Java port of the arduino library for the BNO055 from adafruit.
+ * BNO055 IMU for the FIRST Robotics Competition.
+ * References throughout the code are to the following sensor documentation:
+ *   http://git.io/vuOl1
+ * 
+ * To use the sensor, wire up to it over I2C on the roboRIO.
+ * Creating an instance of this class will cause communications with the sensor
+ *   to being.All communications with the sensor occur in a separate thread
+ *   from your robot code to avoid blocking the main robot program execution.
+ * 
+ *  Example:
+ *    private static BNO055 imu;
+ *    
+ *    public Robot() {
+ *        imu = BNO055.getInstance(BNO055.opmode_t.OPERATION_MODE_IMUPLUS,
+ *        		BNO055.vector_type_t.VECTOR_EULER);
+ *    }
+ * 
+ * You can check the status of the sensor by using the following methods:
+ *   isSensorPresent(); //Checks if the code can talk to the sensor over I2C
+ *                      // If this returns false, check your wiring.
+ *   isInitialized(); //Checks if the sensor initialization has completed.
+ *                    // Initialization takes about 3 seconds. You won't get
+ *                    // position data back from the sensor until its init'd. 
+ *   isCalibrated(); //The BNO055 will return position data after its init'd,
+ *   				 // but the position data may be inaccurate until all
+ *                   // required sensors report they are calibrated. Some
+ *                   // Calibration sequences require you to move the BNO055
+ *                   // around. See the method comments for more info.
  *
+ * Once the sensor calibration is complete , you can get position data by
+ *   by using the getVector() method. See this method definiton for usage info.
+ * 
+ * This code was originally ported from arduino source developed by Adafruit.
+ * See the original comment header below.
+ * 
  * @author james@team2168.org
  *
  *
+ *ORIGINAL ADAFRUIT HEADER - https://github.com/adafruit/Adafruit_BNO055/
+ *=======================================================================
  *This is a library for the BNO055 orientation sensor
  *
  *Designed specifically to work with the Adafruit BNO055 Breakout.
@@ -18,7 +56,7 @@ import edu.wpi.first.wpilibj.I2C;
  *These sensors use I2C to communicate, 2 pins are required to interface.
  *
  *Adafruit invests time and resources providing this open source code,
- *please support Adafruit andopen-source hardware by purchasing products
+ *please support Adafruit and open-source hardware by purchasing products
  *from Adafruit!
  *
  *Written by KTOWN for Adafruit Industries.
@@ -27,14 +65,30 @@ import edu.wpi.first.wpilibj.I2C;
  *
  */
 public class BNO055 {
+	//Tread variables
+	private java.util.Timer executor;
+	private static final long THREAD_PERIOD = 20; //ms - max poll rate on sensor.
+	
 	public static final byte BNO055_ADDRESS_A = 0x28;
 	public static final byte BNO055_ADDRESS_B = 0x29;
 	public static final int BNO055_ID = 0xA0;
 
 	private static BNO055 instance;
+	
 	private static I2C imu;
-	private static boolean initialized = false;
 	private static int _mode;
+	private static opmode_t requestedMode; //user requested mode of operation.
+	private static vector_type_t requestedVectorType;
+	
+	//State machine variables
+	private volatile int state = 0;
+	private volatile boolean sensorPresent = false;
+	private volatile boolean initialized = false;
+	private volatile double currentTime; //seconds
+	private volatile double nextTime; //seconds
+	private volatile byte[] positionVector = new byte[6];
+	private volatile long turns = 0;
+	private volatile double[] xyz = new double[3];
 
 	public class SystemStatus {
 		public int system_status;
@@ -277,153 +331,234 @@ public class BNO055 {
 			return val;
 		}
 	};
-
-	private static final boolean DEBUG = false; //set true to print diagnostics messages
-
+	
 	/**
-	 * Instantiates a new BNO055 class
+	 * Instantiates a new BNO055 class.
 	 *
 	 * @param port the physical port the sensor is plugged into on the roboRio
 	 * @param address the address the sensor is at (0x28 or 0x29)
 	 */
 	private BNO055(I2C.Port port, byte address) {
 		imu = new I2C(port, address);
+		
+		executor = new java.util.Timer();
+		executor.schedule(new BNO055UpdateTask(this), 0L, THREAD_PERIOD);
 	}
 
 	/**
 	 * Get an instance of the IMU object.
+	 * 
+	 * @param mode the operating mode to run the sensor in.
 	 * @param port the physical port the sensor is plugged into on the roboRio
 	 * @param address the address the sensor is at (0x28 or 0x29)
 	 * @return the instantiated BNO055 object
 	 */
-	public static BNO055 getInstance(I2C.Port port, byte address) {
-		if(!initialized) {
+	public static BNO055 getInstance(opmode_t mode, vector_type_t vectorType,
+			I2C.Port port, byte address) {
+		if(instance == null) {
 			instance = new BNO055(port, address);
-			initialized = true;
 		}
-
+		requestedMode = mode;
+		requestedVectorType = vectorType;
 		return instance;
 	}
 
 	/**
 	 * Get an instance of the IMU object plugged into the onboard I2C header.
 	 *   Using the default address (0x28)
+	 *  
+	 * @param mode the operating mode to run the sensor in.
+	 * @param vectorType the format the position vector data should be returned
+	 *   in (if you don't know use VECTOR_EULER).
 	 * @return the instantiated BNO055 object
 	 */
-	public static BNO055 getInstance() {
-		return getInstance(I2C.Port.kOnboard, BNO055_ADDRESS_A);
+	public static BNO055 getInstance(opmode_t mode, vector_type_t vectorType) {
+		return getInstance(mode, vectorType, I2C.Port.kOnboard,
+				BNO055_ADDRESS_A);
 	}
 
 
 	/**
-	 * Sets up the HW
-	 *
-	 * @param mode
-	 * @return
+	 * Called periodically. Communicates with the sensor, and checks its state. 
 	 */
-	public boolean begin(opmode_t mode) {
-		try {
-			/* Make sure we have the right device */
-			byte id = read8(reg_t.BNO055_CHIP_ID_ADDR);
-
-			if((0xFF & id) != BNO055_ID) {
-				Thread.sleep(1000); // hold on for boot
-				id = read8(reg_t.BNO055_CHIP_ID_ADDR);
-				if((0xFF & id) != BNO055_ID) {
-					return false;  // still not? ok bail
+	private void update() {
+		currentTime = Timer.getFPGATimestamp(); //seconds
+		if(!initialized) {
+//			System.out.println("State: " + state + ".  curr: " + currentTime
+//					+ ", next: " + nextTime);
+			
+			//Step through process of initializing the sensor in a non-
+			//  blocking manner. This sequence of events follows the process
+			//  defined in the original adafruit source as closely as possible.
+			//  XXX: It's likely some of these delays can be optimized out.
+			switch(state) {
+			case 0:
+				//Wait for the sensor to be present
+				if((0xFF & read8(reg_t.BNO055_CHIP_ID_ADDR)) != BNO055_ID) {
+					//Sensor not present, keep trying
+					sensorPresent = false;
+				} else {
+					//Sensor present, go to next state
+					sensorPresent = true;
+					state++;
+					nextTime = Timer.getFPGATimestamp() + 0.050;
 				}
+				break;
+			case 1:
+				if(currentTime >= nextTime) {
+					//Switch to config mode (just in case since this is the default)
+					setMode(opmode_t.OPERATION_MODE_CONFIG.getVal());
+					nextTime = Timer.getFPGATimestamp() + 0.050;
+					state++;
+				}
+				break;
+			case 2:
+				// Reset
+				if(currentTime >= nextTime){
+					write8(reg_t.BNO055_SYS_TRIGGER_ADDR, (byte) 0x20);
+					state++;
+				}
+				break;
+			case 3:
+				//Wait for the sensor to be present
+				if((0xFF & read8(reg_t.BNO055_CHIP_ID_ADDR)) == BNO055_ID) {
+					//Sensor present, go to next state
+					state++;
+					//Log current time
+					nextTime = Timer.getFPGATimestamp() + 0.050;
+				}
+				break;
+			case 4:
+				//Wait at least 50ms
+				if(currentTime >= nextTime) {
+					/* Set to normal power mode */
+					write8(reg_t.BNO055_PWR_MODE_ADDR, (byte) powermode_t.POWER_MODE_NORMAL.getVal());
+					nextTime = Timer.getFPGATimestamp() + 0.050;
+					state++;
+				}
+				break;
+			case 5:
+				//Use external crystal - 32.768 kHz
+				if(currentTime >= nextTime) {
+					write8(reg_t.BNO055_PAGE_ID_ADDR, (byte) 0x00);
+					nextTime = Timer.getFPGATimestamp() + 0.050;
+					state++;
+				}
+				break;
+			case 6:
+				if(currentTime >= nextTime) {
+					write8(reg_t.BNO055_SYS_TRIGGER_ADDR, (byte) 0x80);
+					nextTime = Timer.getFPGATimestamp() + 0.500;
+					state++;
+				}
+				break;
+			case 7:
+				//Set operating mode to mode requested at instantiation
+				if(currentTime >= nextTime) {
+					setMode(requestedMode);
+					nextTime = Timer.getFPGATimestamp() + 1.05;
+					state++;
+				}
+				break;
+			case 8:
+				if(currentTime >= nextTime) {
+					state++;
+				}
+			case 9:
+				initialized = true;
+				break;
+			default:
+				//Should never get here - Fail safe
+				initialized = false;
 			}
-
-			/* Switch to config mode (just in case since this is the default) */
-			setMode(opmode_t.OPERATION_MODE_CONFIG.getVal());
-
-			/* Reset */
-			write8(reg_t.BNO055_SYS_TRIGGER_ADDR, (byte) 0x20);
-			while ((0xFF & read8(reg_t.BNO055_CHIP_ID_ADDR)) != BNO055_ID) {
-				Thread.sleep(10);
-			}
-			Thread.sleep(50);
-
-			/* Set to normal power mode */
-			write8(reg_t.BNO055_PWR_MODE_ADDR, (byte) powermode_t.POWER_MODE_NORMAL.getVal());
-			Thread.sleep(10);
-
-			write8(reg_t.BNO055_PAGE_ID_ADDR, (byte) 0x00);
-
-			/* Set the output units */
-			/*
-			byte unitsel = (0 << 7) | // Orientation = Android
-	                  		  (0 << 4) | // Temperature = Celsius
-	                  		  (0 << 2) | // Euler = Degrees
-	                  		  (1 << 1) | // Gyro = Rads
-	                  		  (0 << 0);  // Accelerometer = m/s^2
-			write8(BNO055_UNIT_SEL_ADDR, unitsel);
-			 */
-
-			write8(reg_t.BNO055_SYS_TRIGGER_ADDR, (byte) 0x00);
-			Thread.sleep(10);
-			/* Set the requested operating mode (see section 3.3) */
-			setMode(mode);
-
-			Thread.sleep(20);
-		} catch (InterruptedException e) {
-			e.printStackTrace();
-
-			// TODO Tear down more graciously
-			return false;
+		} else {
+			//Sensor is initialized, periodically query position data
+			calculateVector();
 		}
-
-		return true;
 	}
 
+	/**
+	 * Query the sensor for position data.
+	 */
+	private void calculateVector() {
+		double[] pos = new double[3];
+		short x = 0, y = 0, z = 0;
+		double headingDiff = 0.0;
+		
+		// Read vector data (6 bytes)
+		readLen(requestedVectorType.getVal(), positionVector);
+
+		x = (short)((positionVector[0] & 0xFF)
+				| ((positionVector[1] << 8) & 0xFF00));
+		y = (short)((positionVector[2] & 0xFF)
+				| ((positionVector[3] << 8) & 0xFF00));
+		z = (short)((positionVector[4] & 0xFF)
+				| ((positionVector[5] << 8) & 0xFF00));
+
+		/* Convert the value to an appropriate range (section 3.6.4) */
+		/* and assign the value to the Vector type */
+		switch(requestedVectorType) {
+		case VECTOR_MAGNETOMETER:
+			/* 1uT = 16 LSB */
+			pos[0] = ((double)x)/16.0;
+			pos[1] = ((double)y)/16.0;
+			pos[2] = ((double)z)/16.0;
+			break;
+		case VECTOR_GYROSCOPE:
+			/* 1rps = 900 LSB */
+			pos[0] = ((double)x)/900.0;
+			pos[1] = ((double)y)/900.0;
+			pos[2] = ((double)z)/900.0;
+			break;
+		case VECTOR_EULER:
+			/* 1 degree = 16 LSB */
+			pos[0] = ((double)x)/16.0;
+			pos[1] = ((double)y)/16.0;
+			pos[2] = ((double)z)/16.0;
+			break;
+		case VECTOR_ACCELEROMETER:
+		case VECTOR_LINEARACCEL:
+		case VECTOR_GRAVITY:
+			/* 1m/s^2 = 100 LSB */
+			pos[0] = ((double)x)/100.0;
+			pos[1] = ((double)y)/100.0;
+			pos[2] = ((double)z)/100.0;
+			break;
+		}
+		
+		//calculate turns
+		headingDiff = xyz[0] - pos[0];
+		if(Math.abs(headingDiff) >= 350) {
+			//We've traveled past the zero heading position
+			if(headingDiff > 0) {
+				turns++;
+			} else {
+				turns--;
+			}
+		}
+		
+		//Update position vectors
+		xyz = pos;
+	}
+	
 	/**
 	 * Puts the chip in the specified operating mode
 	 * @param mode
-	 * @throws InterruptedException
 	 */
-	public void setMode(opmode_t mode) throws InterruptedException {
+	public void setMode(opmode_t mode) {
 		setMode(mode.getVal());
 	}
 
-	private void setMode(int mode) throws InterruptedException {
+	private void setMode(int mode) {
 		_mode = mode;
 		write8(reg_t.BNO055_OPR_MODE_ADDR, (byte) _mode);
-		Thread.sleep(30);
-	}
-
-	/**
-	 * Use the external 32.768KHz crystal
-	 * @param usextal
-	 */
-	public void setExtCrystalUse(boolean usextal) {
-		int modeback = _mode;
-
-		/* Switch to config mode (just in case since this is the default) */
-		try {
-			setMode(opmode_t.OPERATION_MODE_CONFIG.getVal());
-			Thread.sleep(25);
-			write8(reg_t.BNO055_PAGE_ID_ADDR, (byte) 0x00);
-			if (usextal) {
-				write8(reg_t.BNO055_SYS_TRIGGER_ADDR, (byte) 0x80);
-			} else {
-				write8(reg_t.BNO055_SYS_TRIGGER_ADDR, (byte) 0x00);
-			}
-			Thread.sleep(10);
-			/* Set the requested operating mode (see section 3.3) */
-			setMode(modeback);
-			Thread.sleep(20);
-		} catch (InterruptedException e) {
-			// TODO Auto-generated catch block
-			e.printStackTrace();
-		}
 	}
 
 	/**
 	 * Gets the latest system status info
 	 * @return
-	 * @throws InterruptedException
 	 */
-	public SystemStatus getSystemStatus() throws InterruptedException {
+	public SystemStatus getSystemStatus() {
 		SystemStatus status = new SystemStatus();
 
 		write8(reg_t.BNO055_PAGE_ID_ADDR, (byte) 0x00);
@@ -467,16 +602,13 @@ public class BNO055 {
 		   9 = Fusion algorithm configuration error
 		   A = Sensor configuration error */
 		status.system_error = read8(reg_t.BNO055_SYS_ERR_ADDR);
-
-		//XXX look into why this sleep is here
-		Thread.sleep(200);
 		return status;
 	}
 
 	/**
 	 * Gets the chip revision numbers
 	 *
-	 * @return
+	 * @return the chips revision information
 	 */
 	public RevInfo getRevInfo() {
 		int a = 0, b = 0;
@@ -502,8 +634,33 @@ public class BNO055 {
 	}
 
 	/**
+	 * Diagnostic method to determine if communications with the sensor are active.
+	 *   Note this method returns true after first establishing communications
+	 *   with the sensor.
+	 *   Communications are not actively monitored once sensor initialization
+	 *     has started.
+	 * @return true if the sensor is found on the I2C bus
+	 */
+	public boolean isSensorPresent() {
+		return sensorPresent;
+	}
+
+	/**
+	 * After power is applied, the sensor needs to be configured for use.
+	 *   During this initialization period the sensor will not return position
+	 *   vector data. Once initialization is complete, data can be read,
+	 *   although the sensor may not have completed calibration.
+	 *   See isCalibrated. 
+	 * @return true when the sensor is initialized.
+	 */
+	public boolean isInitialized() {
+		return initialized;
+	}
+	
+	/**
 	 * Gets current calibration state.
-	 * @return each value will be set to 0 if not calibrated, 3 if fully calibrated.
+	 * @return each value will be set to 0 if not calibrated, 3 if fully
+	 *   calibrated.
 	 */
 	public CalData getCalibration() {
 		CalData data = new CalData();
@@ -520,68 +677,78 @@ public class BNO055 {
 	
 
 	/**
-	 *
+	 * Returns true if all required sensors (accelerometer, magnetometer,
+	 *   gyroscope) have completed their respective calibration sequence.
+	 *   Only sensors required by the current operating mode are checked.
+	 *   See Section 3.3.
+	 * @return true if calibration is complete for all sensors required for the
+	 *   mode the sensor is currently operating in. 
+	 */
+	public boolean isCalibrated() {
+		boolean retVal = true;
+		
+		//Per Table 3-3
+		boolean[][] sensorModeMap = new boolean[][]{
+			//{accel, mag, gyro}
+			{false, false, false}, // OPERATION_MODE_CONFIG
+			{ true, false, false}, // OPERATION_MODE_ACCONLY
+			{false,  true, false}, // OPERATION_MODE_MAGONLY
+			{false, false,  true}, // OPERATION_MODE_GYRONLY
+			{ true,  true, false}, // OPERATION_MODE_ACCMAG
+			{ true, false,  true}, // OPERATION_MODE_ACCGYRO
+			{false,  true,  true}, // OPERATION_MODE_MAGGYRO
+			{ true,  true,  true}, // OPERATION_MODE_AMG
+			{ true, false,  true}, // OPERATION_MODE_IMUPLUS
+			{ true,  true, false}, // OPERATION_MODE_COMPASS
+			{ true,  true, false}, // OPERATION_MODE_M4G
+			{ true,  true,  true}, // OPERATION_MODE_NDOF_FMC_OFF
+			{ true,  true,  true}  // OPERATION_MODE_NDOF
+		};
+
+		CalData data = getCalibration();
+		
+		if(sensorModeMap[_mode][0]) //Accelerometer used
+			retVal = retVal && (data.accel >= 3);
+		if(sensorModeMap[_mode][1]) //Magnetometer used
+			retVal = retVal && (data.mag >= 3);
+		if(sensorModeMap[_mode][2]) //Gyroscope used
+			retVal = retVal && (data.gyro >= 3);
+		
+		return retVal;
+	}
+	
+	/**
+	 * Get the sensors internal temperature.
 	 * @return temperature in degrees celsius.
 	 */
 	public int getTemp() {
-
 		return (read8(reg_t.BNO055_TEMP_ADDR));
 	}
 
 	/**
-	 * Gets a vector reading from the specified source
+	 * Gets a vector representing the sensors position (heading, roll, pitch).
+	 * heading:    0 to 360 degrees
+	 * roll:     -90 to +90 degrees
+	 * pitch:   -180 to +180 degrees
 	 *
-	 * @param vector_type
-	 * @return an array of vectors. [x,y,z]
+	 * For continuous rotation heading (doesn't roll over between 360/0) see
+	 *   the getHeading() method.
+	 *
+	 * Maximum data output rates for Fusion modes - See 3.6.3
+	 * 
+	 * Operating Mode		Data Output Rate
+	 *   IMU                  100 Hz
+	 *   COMPASS               20 Hz
+	 *   M4G                   50 Hz
+	 *   NDOF_FMC_OFF         100 Hz
+	 *   NDOF                 100 Hz
+	 *
+	 * @return a vector [heading, roll, pitch]
 	 */
-	public double[] getVector(vector_type_t vector_type) {
-		final int LEN = 6;
-		double[] xyz = new double[3];
-		byte[] buffer = new byte[LEN];
-
-
-		int x = 0, y = 0, z = 0;
-
-		/* Read vector data (6 bytes) */
-		readLen(vector_type.getVal(), buffer);
-
-		x = (((int)buffer[LEN-6]) & 0xFF) | ((((int)buffer[LEN-5]) << 8) & 0xFF00);
-		y = (((int)buffer[LEN-4]) & 0xFF) | ((((int)buffer[LEN-3]) << 8) & 0xFF00);
-		z = (((int)buffer[LEN-2]) & 0xFF) | ((((int)buffer[LEN-1]) << 8) & 0xFF00);
-
-		/* Convert the value to an appropriate range (section 3.6.4) */
-		/* and assign the value to the Vector type */
-		switch(vector_type) {
-		case VECTOR_MAGNETOMETER:
-			/* 1uT = 16 LSB */
-			xyz[0] = ((double)x)/16.0;
-			xyz[1] = ((double)y)/16.0;
-			xyz[2] = ((double)z)/16.0;
-			break;
-		case VECTOR_GYROSCOPE:
-			/* 1rps = 900 LSB */
-			xyz[0] = ((double)x)/900.0;
-			xyz[1] = ((double)y)/900.0;
-			xyz[2] = ((double)z)/900.0;
-			break;
-		case VECTOR_EULER:
-			/* 1 degree = 16 LSB */
-			xyz[0] = ((double)x)/16.0;
-			xyz[1] = ((double)y)/16.0;
-			xyz[2] = ((double)z)/16.0;
-			break;
-		case VECTOR_ACCELEROMETER:
-		case VECTOR_LINEARACCEL:
-		case VECTOR_GRAVITY:
-			/* 1m/s^2 = 100 LSB */
-			xyz[0] = ((double)x)/100.0;
-			xyz[1] = ((double)y)/100.0;
-			xyz[2] = ((double)z)/100.0;
-			break;
-		}
-
+	public double[] getVector() {
 		return xyz;
 	}
+
 
 	//	/**************************************************************************/
 	//	/*!
@@ -716,6 +883,20 @@ public class BNO055 {
 	 	}
 	 	return true;
 	}
+
+	
+	/**
+	 * The heading of the sensor (x axis) in continuous format. Eg rotating the
+	 *   sensor clockwise two full rotations will return a value of 720 degrees.
+	 * The getVector method will return heading in a constrained 0 - 360 deg
+	 *   format if required.
+	 * @return heading in degrees
+	 */
+	public double getHeading() {
+		return xyz[0] + turns * 360;
+	}
+	
+
 	/**
 	 * Writes an 8 bit value over I2C
 	 * @param reg the register to write the data to
@@ -725,13 +906,10 @@ public class BNO055 {
 	private boolean write8(reg_t reg, byte value) {
 		boolean retVal = false;
 
-		debug("Writing 0x" + Integer.toHexString(value)
-				+ " to: 0x" + Integer.toHexString(reg.getVal()));
 		retVal = imu.write(reg.getVal(), value);
 
 		return retVal;
 	}
-
 
 	/**
 	 * Reads an 8 bit value over I2C
@@ -765,26 +943,31 @@ public class BNO055 {
 	 */
 	private boolean readLen(int reg, byte[] buffer) {
 		boolean retVal = true;
-		//byte[] temp = new byte[1];
 
 		if (buffer == null || buffer.length < 1) {
-			debug("Invalid length received.");
 			return false;
 		}
 
 		retVal = !imu.read(reg, buffer.length, buffer);
-		debug("Reading data from 0x" + Integer.toHexString(reg) + ", ret=" + retVal);
-		for(int i = 0; i < buffer.length; i++) {
-			debug("  Read[" + i + "]: 0x" + Integer.toHexString(buffer[i]));
-		}
 
 		return retVal;
 	}
+	
+	private class BNO055UpdateTask extends TimerTask {
+		private BNO055 imu;
 
+		private BNO055UpdateTask(BNO055 imu) {
+			if (imu == null) {
+				throw new NullPointerException("BNO055 pointer null");
+			}
+			this.imu = imu;
+		}
 
-	private void debug(String val) {
-		if (DEBUG) {
-			System.out.println(val);
+		/**
+		 * Called periodically in its own thread
+		 */
+		public void run() {
+			imu.update();
 		}
 	}
 }

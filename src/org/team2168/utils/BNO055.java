@@ -517,6 +517,8 @@ public class BNO055 {
 		return data;
 	}
 
+	
+
 	/**
 	 *
 	 * @return temperature in degrees celsius.
@@ -630,6 +632,90 @@ public class BNO055 {
 	//		return true;
 	//	}
 
+	
+	///**************************************************************************/
+	/*!
+	@brief  Reads the sensor's offset registers into a byte array
+	*/
+	///**************************************************************************/
+	public byte[] getSensorOffsets() {
+		int modeback = _mode;
+		byte [] calibData = new byte[22];
+		if(isFullyCalibrated()){
+			try {
+				setMode(opmode_t.OPERATION_MODE_CONFIG.getVal());
+				readLen(reg_t.ACCEL_OFFSET_X_LSB_ADDR, calibData);
+				setMode(modeback);
+			} catch (InterruptedException e) {
+				// TODO Auto-generated catch block
+				e.printStackTrace();
+			}
+			return calibData;
+		}
+		return null;
+	}
+	
+	/**************************************************************************/
+	/*!
+	@brief  Writes an array of calibration values to the sensor's offset registers
+	*/
+	/**************************************************************************/
+	void setSensorOffsets(byte[] calibData)
+	{
+	    int modeback = _mode;
+	    try {
+	    setMode(opmode_t.OPERATION_MODE_CONFIG.getVal());
+	    Thread.sleep(25);
+
+	    /* A writeLen() would make this much cleaner */
+	    write8(reg_t.ACCEL_OFFSET_X_LSB_ADDR, calibData[0]);
+	    write8(reg_t.ACCEL_OFFSET_X_MSB_ADDR, calibData[1]);
+	    write8(reg_t.ACCEL_OFFSET_Y_LSB_ADDR, calibData[2]);
+	    write8(reg_t.ACCEL_OFFSET_Y_MSB_ADDR, calibData[3]);
+	    write8(reg_t.ACCEL_OFFSET_Z_LSB_ADDR, calibData[4]);
+	    write8(reg_t.ACCEL_OFFSET_Z_MSB_ADDR, calibData[5]);
+
+	    write8(reg_t.GYRO_OFFSET_X_LSB_ADDR, calibData[6]);
+	    write8(reg_t.GYRO_OFFSET_X_MSB_ADDR, calibData[7]);
+	    write8(reg_t.GYRO_OFFSET_Y_LSB_ADDR, calibData[8]);
+	    write8(reg_t.GYRO_OFFSET_Y_MSB_ADDR, calibData[9]);
+	    write8(reg_t.GYRO_OFFSET_Z_LSB_ADDR, calibData[10]);
+	    write8(reg_t.GYRO_OFFSET_Z_MSB_ADDR, calibData[11]);
+
+	    write8(reg_t.MAG_OFFSET_X_LSB_ADDR, calibData[12]);
+	    write8(reg_t.MAG_OFFSET_X_MSB_ADDR, calibData[13]);
+	    write8(reg_t.MAG_OFFSET_Y_LSB_ADDR, calibData[14]);
+	    write8(reg_t.MAG_OFFSET_Y_MSB_ADDR, calibData[15]);
+	    write8(reg_t.MAG_OFFSET_Z_LSB_ADDR, calibData[16]);
+	    write8(reg_t.MAG_OFFSET_Z_MSB_ADDR, calibData[17]);
+
+	    write8(reg_t.ACCEL_RADIUS_LSB_ADDR, calibData[18]);
+	    write8(reg_t.ACCEL_RADIUS_MSB_ADDR, calibData[19]);
+
+	    write8(reg_t.MAG_RADIUS_LSB_ADDR, calibData[20]);
+	    write8(reg_t.MAG_RADIUS_MSB_ADDR, calibData[21]);
+
+	   
+			setMode(modeback);
+		} catch (InterruptedException e) {
+			// TODO Auto-generated catch block
+			e.printStackTrace();
+		}
+	}
+
+
+	
+	
+	/*
+	 * Checks if device is calibrated returns true if so
+	 */
+	public boolean isFullyCalibrated(){
+		CalData data = this.getCalibration();
+	 	if (data.sys < 3||data.gyro <3 || data.accel < 3 || data.mag < 3) {
+	 		return false;
+	 	}
+	 	return true;
+	}
 	/**
 	 * Writes an 8 bit value over I2C
 	 * @param reg the register to write the data to
